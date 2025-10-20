@@ -2,7 +2,7 @@
 FROM python:3.10-slim-buster
 
 # Install system dependencies needed for unpacking code
-RUN apt-get update && apt-get install -y --no-install-recommends tar wget ca-certificates && \
+RUN apt-get update && apt-get install -y --no-install-recommends tar wget curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Download and install the Trivy binary
@@ -22,12 +22,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the server code into the container
 COPY main.py .
+COPY app ./app
 
 # Expose port and run the server
 EXPOSE 8000
 
 # Healthcheck for robust deployments
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8000/ || exit 1
+  CMD curl -f http://localhost:8000/healthz || exit 1
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

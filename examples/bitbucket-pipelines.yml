@@ -1,0 +1,15 @@
+pipelines:
+  default:
+    - step:
+        name: Trivy Scan
+        image: python:3.11-slim
+        script:
+          - pip install httpx
+          - python tools/trivy_scan_client.py . \
+              --api-url "$SCANNER_API_URL" \
+              --api-key "$SCANNER_API_KEY" \
+              --severity "CRITICAL,HIGH" \
+              --fail-on "CRITICAL,HIGH" \
+              --output scan-report.json
+        artifacts:
+          - scan-report.json

@@ -1,0 +1,39 @@
+name: Trivy Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  trivy-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install CLI dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx
+
+      - name: Run Trivy scanner API
+        env:
+          SCANNER_API_KEY: \
+            \\${{ secrets.SCANNER_API_KEY }}
+          SCANNER_API_URL: \
+            \\${{ secrets.SCANNER_API_URL }}
+        run: |
+          python tools/trivy_scan_client.py \
+            . \
+            --api-url "$SCANNER_API_URL" \
+            --api-key "$SCANNER_API_KEY" \
+            --severity "CRITICAL,HIGH" \
+            --fail-on "CRITICAL,HIGH" \
+            --output scan-report.json
+
+      - name: Upload scan report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-scan-report
+          path: scan-report.json
