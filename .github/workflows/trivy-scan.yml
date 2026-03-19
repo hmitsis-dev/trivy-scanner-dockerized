@@ -19,10 +19,8 @@ jobs:
 
       - name: Run Trivy scanner API
         env:
-          SCANNER_API_KEY: \
-            \\${{ secrets.SCANNER_API_KEY }}
-          SCANNER_API_URL: \
-            \\${{ secrets.SCANNER_API_URL }}
+          SCANNER_API_KEY: ${{ secrets.SCANNER_API_KEY }}
+          SCANNER_API_URL: ${{ secrets.SCANNER_API_URL }}
         run: |
           python tools/trivy_scan_client.py \
             . \
