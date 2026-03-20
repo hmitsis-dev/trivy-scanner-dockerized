@@ -1,5 +1,5 @@
 # Use a lightweight Python base image
-FROM python:3.10-slim-buster
+FROM python:3.12-slim
 
 # Install system dependencies needed for unpacking code
 RUN apt-get update && apt-get install -y --no-install-recommends tar wget curl ca-certificates && \
