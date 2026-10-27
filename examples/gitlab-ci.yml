@@ -1,0 +1,9 @@
+trivy-scan:
+  image: python:3.12-slim
+  script:
+    - pip install "git+https://github.com/hmitsis-dev/trivy-scanner-dockerized.git@v2.1.0"
+    # SCANNER_API_URL and SCANNER_API_KEY come from masked CI/CD variables.
+    - trivy-scan . --fail-on CRITICAL,HIGH --output scan-report.json
+  artifacts:
+    when: always
+    paths: [scan-report.json]

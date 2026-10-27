@@ -1,34 +1,55 @@
-# Use a lightweight Python base image
+# syntax=docker/dockerfile:1
+
+FROM python:3.12-slim AS build
+WORKDIR /src
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN pip wheel --no-cache-dir --wheel-dir /wheels ".[server,s3,oidc]"
+
+
 FROM python:3.12-slim
 
-# Install system dependencies needed for unpacking code
-RUN apt-get update && apt-get install -y --no-install-recommends tar wget curl ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# Pin and verify Trivy. Override with --build-arg TRIVY_VERSION=x.y.z.
+ARG TRIVY_VERSION=0.69.3
+ARG TARGETARCH
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) arch=64bit ;; \
+      arm64) arch=ARM64 ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"; \
+    tarball="trivy_${TRIVY_VERSION}_Linux-${arch}.tar.gz"; \
+    cd /tmp; \
+    curl -fsSLO "${base}/${tarball}"; \
+    curl -fsSLO "${base}/trivy_${TRIVY_VERSION}_checksums.txt"; \
+    grep " ${tarball}\$" "trivy_${TRIVY_VERSION}_checksums.txt" | sha256sum -c -; \
+    tar -xzf "${tarball}" -C /usr/local/bin trivy; \
+    rm -f /tmp/trivy_*; \
+    apt-get purge -y --auto-remove curl; \
+    rm -rf /var/lib/apt/lists/*; \
+    trivy --version
 
-# Download and install the Trivy binary
-ARG TRIVY_VERSION=0.50.1
-RUN wget -q https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.deb && \
-    dpkg -i trivy_${TRIVY_VERSION}_Linux-64bit.deb && \
-    rm trivy_${TRIVY_VERSION}_Linux-64bit.deb
+COPY --from=build /wheels /wheels
+RUN pip install --no-cache-dir --no-index --find-links /wheels "trivy-scanner-api[server,s3,oidc]" \
+    && rm -rf /wheels
 
-# Create a non-root user and switch to it
-RUN adduser --system --group appuser
-USER appuser
-WORKDIR /app
+RUN useradd --system --uid 10001 --create-home --home-dir /home/scanner scanner \
+    && mkdir -p /var/cache/trivy /data/reports \
+    && chown -R scanner:scanner /var/cache/trivy /data
 
-# Install Python web server dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+ENV PYTHONUNBUFFERED=1 \
+    TRIVY_CACHE_DIR=/var/cache/trivy \
+    STORAGE_BACKEND=local \
+    LOCAL_STORAGE_PATH=/data/reports
 
-# Copy the server code into the container
-COPY main.py .
-COPY app ./app
-
-# Expose port and run the server
+USER scanner
+WORKDIR /home/scanner
 EXPOSE 8000
 
-# Healthcheck for robust deployments
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8000/healthz || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["trivy-scanner-server"]

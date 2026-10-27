@@ -1,307 +1,273 @@
 # Trivy Scanner API
 
-> Self-hosted CVE scanning as a service — one HTTP endpoint for every CI pipeline in your organization.
+> Self-hosted Trivy scanning as a service: one HTTP endpoint for every CI pipeline in your organization, plus a small client to call it.
 
+[![CI](https://github.com/hmitsis-dev/trivy-scanner-dockerized/actions/workflows/ci.yml/badge.svg)](https://github.com/hmitsis-dev/trivy-scanner-dockerized/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Most teams install Trivy directly in each CI job, scatter results across pipeline logs, and never build a consistent audit trail. As the number of pipelines grows, keeping Trivy versions in sync, enforcing uniform severity thresholds, and routing alerts to the right channel becomes a maintenance burden spread across every repository.
+Most teams install Trivy in every CI job, scatter results across pipeline logs, and never build a consistent audit trail. This project runs Trivy behind a FastAPI service that any pipeline can reach over HTTP. Upload an archive, get back severity counts and a pass/fail verdict, and let the service handle report storage, alerting, and (optionally) AI remediation hints.
 
-This project packages Trivy into a hardened FastAPI service that any pipeline can reach over HTTP. Upload an archive, get back a structured JSON report, and let the service handle persistence, alerting, and optional AI-assisted remediation — all from one place you control.
+It ships as three things:
 
-## Architecture
+| Piece | What it is | Get it |
+|-------|------------|--------|
+| **Server** | FastAPI service wrapping a pinned Trivy binary | `docker run ghcr.io/hmitsis-dev/trivy-scanner-dockerized` or `pip install "trivy-scanner-api[server]"` |
+| **Client** | `trivy-scan` CLI and `ScannerClient` Python class (only depends on `httpx`) | `pip install trivy-scanner-api` |
+| **GitHub Action** | Wraps the client, supports keyless OIDC auth | `uses: hmitsis-dev/trivy-scanner-dockerized@v2` |
 
 ```
-  CI Pipeline (GitHub / Bitbucket / GitLab / Jenkins)
-       │
-       │  POST /scan-and-store  (multipart archive + optional overrides)
-       │  X-API-Key  or  OIDC Bearer Token
-       ▼
- ┌─────────────────────────────────────────────────────┐
- │                  FastAPI Service                     │
- │                                                     │
- │  1. Authenticate request (API key / OIDC / open)    │
- │  2. Validate archive (size, extension, zip-slip)    │
- │  3. Extract to isolated temporary directory         │
- │  4. Run Trivy (fs / config / image mode)            │
- │  5. Evaluate severity thresholds → failed flag      │
- │  6. Persist enriched report                         │
- │  7. Fire webhook  (Slack / Teams / custom)          │
- │  8. Generate AI remediation  (optional)             │
- └──────────────────┬──────────────────────────────────┘
-                    │
-         ┌──────────┴──────────┐
-         │                     │
-         ▼                     ▼
-      AWS S3               Local FS
-   (production)          (development)
+  CI pipeline ── trivy-scan ──►  POST /scan-and-store  (tar.gz + options, API key or OIDC token)
+                                        │
+                     ┌──────────────────┴──────────────────┐
+                     │ 1. authenticate                      │
+                     │ 2. validate + safely extract archive │
+                     │ 3. run Trivy (fs / config / rootfs)  │
+                     │ 4. apply fail-on thresholds          │
+                     │ 5. store report (local disk or S3)   │
+                     │ 6. notify webhook (Slack / Teams)    │
+                     │ 7. AI remediation (optional)         │
+                     └──────────────────────────────────────┘
 ```
 
-## Why a Service Instead of Bare Trivy?
-
-| Concern | Direct Trivy per pipeline | This service |
-|---------|--------------------------|--------------|
-| Trivy version drift | Each repo pins its own | One container, one version |
-| Severity enforcement | Per-repo copy-paste | Centrally configured, per-request overrides allowed |
-| Audit trail | Scattered pipeline logs | Every report persisted to S3 or local disk |
-| Alerting | Custom script per repo | Single webhook config covers all pipelines |
-| AI remediation | Not feasible | Local LLM runs in the same process, no data leaves |
-| Cloud credentials | Needed in every runner | Only the scanner service holds them |
-
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Build the image
-docker build -t trivy-scanner .
-
-# 2. Run with local storage (no AWS needed)
-docker run -d --rm -p 8000:8000 \
-  -e AUTH_MODE=api_key \
+# 1. Run the server (reports land in a Docker volume)
+docker run -d -p 8000:8000 \
   -e SCANNER_API_KEY=dev-secret \
-  -e STORAGE_BACKEND=local \
-  -e LOCAL_STORAGE_PATH=/reports \
-  -v "$(pwd)/reports:/reports" \
-  trivy-scanner
+  -v trivy-cache:/var/cache/trivy \
+  ghcr.io/hmitsis-dev/trivy-scanner-dockerized:latest
 
-# 3. Scan the current directory
-python tools/trivy_scan_client.py . \
-  --api-url http://localhost:8000/scan-and-store \
-  --api-key dev-secret \
-  --fail-on CRITICAL,HIGH
+# 2. Install the client and scan the current directory
+pip install trivy-scanner-api
+trivy-scan . --api-url http://localhost:8000 --api-key dev-secret --fail-on CRITICAL,HIGH
 ```
 
-A JSON report lands in `./reports/` and the terminal prints severity counts alongside the report path. Exit code `2` means blocking vulnerabilities were found.
+Exit codes: `0` passed, `1` request error, `2` blocking findings.
 
-## How It Works
+> Until the first release is published to GHCR/PyPI, build from a checkout instead:
+> `docker build -t trivy-scanner .` and `pip install .`
 
-### 1. Upload & Validate
+`examples/docker-compose.yml` shows a persistent deployment with named volumes for reports and the Trivy DB cache.
 
-`POST /scan-and-store` accepts a `.tar.gz` or `.tgz` archive. Before any bytes are extracted the service:
+## Using it from CI
 
-- Rejects files larger than `MAX_ARCHIVE_SIZE_MB` (default 200 MB).
-- Refuses extensions not in `ALLOWED_ARCHIVES`.
-- Counts members before extraction; archives with more than 10,000 entries are rejected (DoS mitigation).
-- Resolves every member path against the destination directory and aborts if any entry would escape it (zip-slip protection).
-- Rejects symbolic and hard links outright.
+### GitHub Actions
 
-Extraction happens inside a `tempfile.TemporaryDirectory` that is deleted when the request finishes, regardless of success or failure.
+```yaml
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # only for OIDC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hmitsis-dev/trivy-scanner-dockerized@v2
+        with:
+          api-url: ${{ vars.SCANNER_API_URL }}
+          api-key: ${{ secrets.SCANNER_API_KEY }}   # or: oidc-audience: trivy-scanner
+          fail-on: CRITICAL,HIGH
+```
 
-### 2. Trivy Invocation
+Inputs: `api-url`, `api-key`, `oidc-audience`, `path`, `severity`, `fail-on`, `scan-mode`, `exclude`, `output` (default `scan-report.json`). See `examples/github-actions.yml`.
 
-`ScanOptions.as_command()` builds the Trivy argument list, respects `TRIVY_CACHE_DIR` so the vulnerability database is shared across scans, and applies a configurable `TRIVY_TIMEOUT_SECONDS`. The subprocess inherits only a sanitized copy of the environment. Trivy outputs JSON, which is parsed directly — a non-zero exit code surfaces as an HTTP 500 with the stderr text included for debuggability.
+### GitLab, Bitbucket, Jenkins, anything else
 
-### 3. Severity Thresholds and the `failed` Flag
+```bash
+pip install trivy-scanner-api
+export SCANNER_API_URL=https://scanner.example.com SCANNER_API_KEY=...
+trivy-scan . --fail-on CRITICAL,HIGH --output scan-report.json
+```
 
-Two severity concepts are kept separate on purpose:
+Ready-made configs: `examples/gitlab-ci.yml`, `examples/bitbucket-pipelines.yml`.
 
-- `TRIVY_SEVERITY` — which severities Trivy should *report*.
-- `TRIVY_FAIL_ON_SEVERITY` — which severities set `failed: true` in the response (and exit code `2` from the CLI client).
+### CLI reference
 
-This lets you scan for all severities while only blocking the pipeline on CRITICAL findings. Per-request overrides (controlled by `ALLOW_REQUEST_OVERRIDES`) let individual pipelines tighten thresholds without changing the server configuration.
+```
+trivy-scan [SOURCE] [--api-url URL] [--api-key KEY | --token JWT | --github-oidc AUDIENCE]
+           [--severity LIST] [--fail-on LIST] [--scan-mode fs|config|rootfs]
+           [--ignore-unfixed | --no-ignore-unfixed] [--ignore-policy FILE.rego]
+           [--exclude GLOBS] [--no-default-excludes] [--timeout SECONDS]
+           [--output FILE] [--quiet] [--insecure]
+```
 
-### 4. Report Persistence
+`--api-url`, `--api-key` and `--token` fall back to `SCANNER_API_URL`, `SCANNER_API_KEY` and `SCANNER_TOKEN`. `.git`, `node_modules`, `__pycache__` and `.venv` are excluded by default; symlinks are never uploaded.
 
-Every report is decorated with `scanner_metadata` (scan mode, severity filter, requesting identity, `failed` flag) before storage. The `StorageProvider` abstract base class makes it straightforward to add Google Cloud Storage or Azure Blob Storage without touching the rest of the application — subclass it and update `get_storage_provider`.
+### Python API
 
-### 5. Webhooks
+```python
+from trivy_scanner.client import ScannerClient
 
-After every scan the service POSTs to `WEBHOOK_URL` (if configured) with overall status, severity counts, report URI, and any AI recommendation. Slack incoming webhooks, Microsoft Teams connectors, and generic HTTP endpoints all accept this payload. Custom auth headers (e.g., `Authorization: Bearer <token>`) are supported via `WEBHOOK_HEADERS`.
+client = ScannerClient("https://scanner.example.com", api_key="...")
+result = client.scan_directory(".", fail_on="CRITICAL", severity="CRITICAL,HIGH,MEDIUM")
+print(result["severity_counts"], result["report_uri"])
+```
 
-### 6. AI Remediation
-
-When `AI_REMEDIATION_ENABLED=true` and `AI_MODEL_PATH` points to a `.gguf` model file, the service loads it once at startup via `llama-cpp-python`. For each scan it builds a structured prompt from the top findings (capped at 10 to keep inference fast) and returns bullet-point remediation advice alongside the report. A 4-bit quantized 7B instruction model fits in roughly 5 GB of RAM and produces useful output in 5–15 seconds on CPU.
-
-No vulnerability data ever leaves your infrastructure.
+The server is also embeddable: `trivy_scanner.api.create_app(settings, storage=...)` returns a FastAPI app, so you can mount it in another service or pass your own `StorageProvider`.
 
 ## Authentication
 
-| Mode | How to Enable | Best For |
-|------|--------------|---------|
-| `api_key` | Set `SCANNER_API_KEY`; send `X-API-Key` header | Simple shared secret for internal pipelines |
-| `oidc` | Set `OIDC_ISSUER` and `OIDC_AUDIENCE` | GitHub Actions OIDC — no long-lived secrets |
-| `none` | `AUTH_MODE=none` | Air-gapped or private networks |
+| `AUTH_MODE` | Configure | Client sends |
+|-------------|-----------|--------------|
+| `api_key` (default) | `SCANNER_API_KEY` | `X-API-Key` header (`--api-key`) |
+| `oidc` | `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_REQUIRED_CLAIMS` | `Authorization: Bearer` (`--token` / `--github-oidc`) |
+| `none` | nothing | nothing; only for private networks |
 
-The OIDC implementation fetches JWKS from `{issuer}/.well-known/jwks.json`, caches keys for one hour, and refreshes on unknown `kid` to handle key rotation gracefully.
+OIDC keys are discovered through the issuer's `/.well-known/openid-configuration`, cached, and refreshed on key rotation. Tokens must carry valid `iss`, `aud` and `exp`.
 
-## Configuration Reference
+**Keyless GitHub Actions:** set
+
+```
+AUTH_MODE=oidc
+OIDC_ISSUER=https://token.actions.githubusercontent.com
+OIDC_AUDIENCE=trivy-scanner
+OIDC_REQUIRED_CLAIMS=repository_owner=your-org
+```
+
+and use `oidc-audience: trivy-scanner` in the action. `OIDC_REQUIRED_CLAIMS` is mandatory for the GitHub issuer: any public repository can mint a token for any audience, so without it every GitHub user could use your scanner. Restrict further with e.g. `repository=your-org/app,ref=refs/heads/main`.
+
+## Configuration
+
+All server settings are environment variables.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AUTH_MODE` | `api_key` | `api_key`, `oidc`, or `none` |
-| `SCANNER_API_KEY` | — | Required when `AUTH_MODE=api_key` |
-| `OIDC_ISSUER` | — | e.g. `https://token.actions.githubusercontent.com` |
-| `OIDC_AUDIENCE` | — | Expected audience claim |
-| `OIDC_ALGORITHMS` | `RS256` | Comma-separated signing algorithms |
-| `STORAGE_BACKEND` | `s3` | `s3` or `local` |
-| `S3_BUCKET_NAME` | — | Required when using S3 |
-| `S3_REPORT_PREFIX` | `reports/` | Folder prefix inside the bucket |
-| `LOCAL_STORAGE_PATH` | `./reports` | Directory for JSON reports |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | — | Standard AWS credentials (IAM role also accepted) |
+| `AUTH_MODE` | `api_key` | `api_key`, `oidc` or `none` |
+| `SCANNER_API_KEY` | — | Required for `api_key` mode |
+| `OIDC_ISSUER` / `OIDC_AUDIENCE` | — | Required for `oidc` mode |
+| `OIDC_ALGORITHMS` | `RS256` | Accepted signing algorithms |
+| `OIDC_REQUIRED_CLAIMS` | — | `claim=value` pairs, comma separated, all must match |
+| `STORAGE_BACKEND` | `local` | `local` or `s3` |
+| `LOCAL_STORAGE_PATH` | `./reports` (`/data/reports` in Docker) | Report directory |
+| `S3_BUCKET_NAME` | — | Required for `s3`; credentials come from the standard AWS chain (env, profile, IAM role) |
+| `S3_REPORT_PREFIX` | `reports/` | Key prefix inside the bucket |
 | `TRIVY_BINARY` | `trivy` | Path to the Trivy executable |
-| `TRIVY_DEFAULT_MODE` | `fs` | Scan mode: `fs`, `config`, or `image` |
+| `TRIVY_DEFAULT_MODE` | `fs` | `fs`, `config` or `rootfs` |
 | `TRIVY_SEVERITY` | `CRITICAL,HIGH` | Severities included in the report |
 | `TRIVY_FAIL_ON_SEVERITY` | — | Severities that set `failed: true` |
-| `TRIVY_IGNORE_UNFIXED` | `true` | Skip vulnerabilities with no fix available |
-| `TRIVY_TIMEOUT_SECONDS` | `600` | Kill Trivy if it exceeds this threshold |
-| `TRIVY_ADDITIONAL_ARGS` | — | Extra CLI flags appended to every invocation |
-| `TRIVY_IGNORE_POLICY_PATH` | — | Path to a mounted Rego ignore policy |
-| `TRIVY_CACHE_DIR` | — | Shared DB cache path (speeds up repeated scans) |
-| `MAX_ARCHIVE_SIZE_MB` | `200` | Hard cap on uploaded archive size |
-| `ALLOWED_ARCHIVES` | `.tar.gz,.tgz` | Accepted archive extensions |
-| `ALLOW_REQUEST_OVERRIDES` | `true` | Let pipelines override scan options per request |
-| `WEBHOOK_URL` | — | Endpoint to notify after each scan |
-| `WEBHOOK_HEADERS` | — | `Header:Value` pairs, comma-separated |
-| `AI_REMEDIATION_ENABLED` | `false` | Enable AI summaries |
-| `AI_MODEL_PATH` | — | Path to a `.gguf` model file |
-| `AI_CONTEXT_TOKENS` | `2048` | Model context window size |
-| `AI_MAX_OUTPUT_TOKENS` | `512` | Maximum tokens generated |
+| `TRIVY_IGNORE_UNFIXED` | `true` | Skip vulnerabilities without a fix |
+| `TRIVY_TIMEOUT_SECONDS` | `600` | Kill Trivy after this long |
+| `TRIVY_ADDITIONAL_ARGS` | — | Extra flags for every run, comma separated |
+| `TRIVY_IGNORE_POLICY_PATH` | — | Server-side Rego ignore policy |
+| `TRIVY_CACHE_DIR` | `/var/cache/trivy` in Docker | Vulnerability DB cache; mount a volume to keep it |
+| `ALLOW_REQUEST_OVERRIDES` | `true` | Let clients override mode, severities and ignore policy |
+| `MAX_ARCHIVE_SIZE_MB` | `200` | Upload size limit |
+| `MAX_EXTRACTED_SIZE_MB` | `1024` | Limit on total extracted size |
+| `MAX_ARCHIVE_MEMBERS` | `10000` | Limit on files per archive |
+| `ALLOWED_ARCHIVES` | `.tar.gz,.tgz` | Accepted extensions |
+| `WEBHOOK_URL` | — | Called after every scan |
+| `WEBHOOK_HEADERS` | — | `Header:Value` pairs, comma separated |
+| `AI_REMEDIATION_ENABLED` | `false` | Enable AI hints (needs the `ai` extra) |
+| `AI_MODEL_PATH` | — | Path to a `.gguf` model |
+| `AI_CONTEXT_TOKENS` / `AI_MAX_OUTPUT_TOKENS` / `AI_TEMPERATURE` | `2048` / `512` / `0.2` | Model settings |
+| `HOST` / `PORT` / `LOG_LEVEL` | `0.0.0.0` / `8000` / `info` | `trivy-scanner-server` bind and logging |
 
-## API Reference
+`TRIVY_SEVERITY` controls what Trivy reports; `TRIVY_FAIL_ON_SEVERITY` controls what fails the pipeline. You can report everything and only block on `CRITICAL`.
+
+## API
 
 ### `POST /scan-and-store`
 
-**Request** — `multipart/form-data`
+`multipart/form-data` fields:
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `file` | file | Yes | `.tar.gz` or `.tgz` archive |
-| `scan_mode` | string | No | Override default Trivy mode |
-| `severity` | string | No | Comma-separated severity override |
-| `ignore_unfixed` | string | No | `true` or `false` |
-| `fail_on_severity` | string | No | Comma-separated severities that trigger `failed: true` |
-| `trivy_ignore_policy` | string | No | Inline Rego ignore policy |
-
-**Response**
+| Field | Required | Description |
+|-------|----------|-------------|
+| `file` | yes | `.tar.gz` / `.tgz` archive |
+| `scan_mode` | no | `fs`, `config` or `rootfs` |
+| `severity` | no | Comma separated severities to report |
+| `ignore_unfixed` | no | `true` / `false` |
+| `fail_on_severity` | no | Comma separated severities that set `failed` |
+| `trivy_ignore_policy` | no | Rego ignore policy **contents** |
 
 ```json
 {
   "status": "completed",
-  "failed": false,
-  "report_uri": "s3://my-bucket/reports/2024-11-01T120000Z-project.json",
-  "severity_counts": {
-    "CRITICAL": 0,
-    "HIGH": 2,
-    "MEDIUM": 7,
-    "LOW": 12,
-    "UNKNOWN": 0
-  },
-  "ai_recommendation": "- Upgrade requests to >=2.32.0 to fix CVE-2024-35195\n- Pin cryptography to >=42.0.4"
+  "failed": true,
+  "message": "Failing due to configured severity threshold",
+  "report_uri": "/data/reports/2026-10-27T120000123456Z-project.json",
+  "severity_counts": {"CRITICAL": 0, "HIGH": 2, "MEDIUM": 0, "LOW": 0, "UNKNOWN": 0},
+  "ai_recommendation": null
 }
 ```
 
-When `failed` is `true` the response also includes `"message": "Failing due to configured severity threshold"`. The AI recommendation field is only present when the AI feature is enabled and the model loaded successfully.
+Counts and the `failed` verdict cover vulnerabilities, failed misconfigurations and secrets. The stored report is Trivy's full JSON plus a `scanner_metadata` block (mode, filters, verdict, requester identity). Interactive docs are at `/docs`.
 
 ### `GET /healthz`
 
-Returns `{"status": "ok"}`. Consumed by the Docker `HEALTHCHECK` directive and load-balancer health probes.
+`{"status": "ok", "version": "..."}`. Used by the image's `HEALTHCHECK`.
 
-## Pipeline Integration
-
-### CLI Helper
-
-`tools/trivy_scan_client.py` creates a tar archive from a local directory, uploads it, prints the full JSON result, and exits with code `2` when the scan reports blocking vulnerabilities so your pipeline can fail fast. It requires only `httpx` — no extra dependencies.
-
-```bash
-python tools/trivy_scan_client.py /path/to/project \
-  --api-url "https://scanner.example.com/scan-and-store" \
-  --api-key "$SCANNER_API_KEY" \
-  --severity "CRITICAL,HIGH,MEDIUM" \
-  --fail-on "CRITICAL" \
-  --exclude ".git,node_modules,dist" \
-  --output scan-report.json
-```
-
-Exit codes: `0` = passed, `1` = request error, `2` = blocking vulnerabilities found.
-
-### GitHub Actions
-
-`.github/workflows/trivy-scan.yml` is a ready-to-use workflow that runs on every push and pull request. Configure `SCANNER_API_URL` and `SCANNER_API_KEY` as repository secrets and the JSON report is uploaded as a workflow artifact.
-
-For keyless authentication, switch to `AUTH_MODE=oidc` on the server with `OIDC_ISSUER=https://token.actions.githubusercontent.com`. Drop the `SCANNER_API_KEY` secret entirely — the Actions OIDC token is validated automatically.
-
-### Bitbucket Pipelines
-
-`examples/bitbucket-pipelines.yml` mirrors the GitHub Actions setup. Add `SCANNER_API_URL` and `SCANNER_API_KEY` as secured repository variables; the `scan-report.json` is captured as a pipeline artifact.
-
-### GitLab / Jenkins / Others
-
-Any runner that can execute `pip install httpx && python tools/trivy_scan_client.py ...` works out of the box. Jenkins users can publish the output JSON via the `archiveArtifacts` step.
-
-For co-located deployments (runner and scanner on the same host or in the same Kubernetes pod), point `--api-url` at `http://localhost:8000/scan-and-store` to eliminate egress entirely.
-
-## Webhook Payload
+### Webhook payload
 
 ```json
 {
+  "text": "Trivy scan failed (CRITICAL: 1, HIGH: 3, ...). Report: s3://bucket/reports/....json",
   "status": "failed",
-  "severity_counts": {
-    "CRITICAL": 1,
-    "HIGH": 3,
-    "MEDIUM": 5,
-    "LOW": 0,
-    "UNKNOWN": 0
-  },
-  "report_uri": "s3://my-bucket/reports/2024-11-01T120000Z-project.json",
-  "ai_recommendation": "- Upgrade openssl to >=3.3.1 to address CVE-2024-4603"
+  "severity_counts": {"CRITICAL": 1, "HIGH": 3, "MEDIUM": 5, "LOW": 0, "UNKNOWN": 0},
+  "report_uri": "s3://bucket/reports/....json"
 }
 ```
 
-Slack incoming webhooks, Microsoft Teams connectors, and PagerDuty event APIs all accept this shape directly. For services that require a specific auth header, set `WEBHOOK_HEADERS=Authorization:Bearer <token>`.
+The `text` field makes it work with Slack and Teams incoming webhooks as-is.
 
-## AI Remediation (Optional)
+## Security model
 
-1. Install the optional dependency: `pip install -r requirements-ai.txt`
-2. Download a GGUF model — `TheBloke/CodeLlama-7B-Instruct-GGUF` (Q4_K_M quantization) is a good starting point and fits comfortably on a 2-vCPU, 8 GB RAM instance.
-3. Set `AI_REMEDIATION_ENABLED=true` and `AI_MODEL_PATH=/models/codellama-7b-instruct.Q4_K_M.gguf`.
+Uploaded archives are untrusted input. Before Trivy sees them the server:
 
-The model loads once at startup and is reused for every scan. The prompt is built from the top 10 findings (title, severity, CVE ID, truncated description) and asks for bullet-point remediation steps. Treat the output as advisory — it reliably surfaces useful version pins and configuration suggestions, but always review before merging to production.
+- strips directory components from the upload filename;
+- streams the upload to disk and stops once it passes `MAX_ARCHIVE_SIZE_MB`;
+- rejects archives with too many members, more than `MAX_EXTRACTED_SIZE_MB` of content, paths that escape the extraction directory, links, or device files;
+- extracts with Python's `data` filter into a temporary directory that is removed after the request;
+- validates scan mode and severities against allow-lists before building the Trivy command (no shell involved).
+
+The container runs as an unprivileged user, and the Trivy release tarball is checked against its published SHA-256 checksums at build time. API keys are compared in constant time.
+
+## AI remediation (optional)
+
+1. `pip install "trivy-scanner-api[server,ai]"` (or extend the image).
+2. Download a GGUF instruction model, e.g. a Q4_K_M 7B model (about 5 GB RAM).
+3. Set `AI_REMEDIATION_ENABLED=true` and `AI_MODEL_PATH=/models/model.gguf`.
+
+The model loads once at startup and gets the top 10 findings per scan. Nothing leaves your infrastructure. Treat the output as a hint, not a fix.
 
 ## Extending
 
-### Adding a Storage Backend
-
-Subclass `StorageProvider` in `app/storage.py` and register it in `get_storage_provider`:
+**Storage backend:** subclass `trivy_scanner.storage.StorageProvider` and pass it to `create_app`:
 
 ```python
-class GCSStorageProvider(StorageProvider):
-    def store_report(self, key: str, content: Dict) -> str:
-        blob = self.bucket.blob(key)
-        blob.upload_from_string(json.dumps(content), content_type="application/json")
+import json
+
+from trivy_scanner.api import create_app
+from trivy_scanner.storage import StorageProvider
+
+class GCSStorage(StorageProvider):
+    def __init__(self, bucket):
+        self.bucket = bucket
+
+    def store_report(self, key, content):
+        self.bucket.blob(key).upload_from_string(json.dumps(content), content_type="application/json")
         return f"gs://{self.bucket.name}/{key}"
+
+app = create_app(storage=GCSStorage(bucket))
 ```
 
-### Adding an Auth Strategy
+**Auth strategy:** add a callable to `trivy_scanner/auth.py` and select it in `build_auth_dependency`. It must work as a FastAPI dependency and return a dict with at least `sub`.
 
-Add a new async callable to `app/auth.py` and expose it via the `AUTH_MODE` switch in `get_auth_dependency`. The callable must be compatible with FastAPI's dependency injection and return a dict containing at least a `sub` key (used as the requesting identity in stored reports).
-
-## Local Development
+## Development
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt
-
-export AUTH_MODE=api_key
-export SCANNER_API_KEY=dev-secret
-export STORAGE_BACKEND=local
-export LOCAL_STORAGE_PATH=./.local-reports
-
-uvicorn main:app --reload
-```
-
-## Testing
-
-```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
 pytest
+ruff check . && ruff format --check .
+
+# run the server locally (needs trivy on PATH)
+AUTH_MODE=none trivy-scanner-server
 ```
 
-The test suite uses `fastapi.TestClient`, monkeypatches `run_trivy_scan` with a fixture that returns a controlled report dict, and covers both the clean-scan and blocking-severity paths. No live Trivy binary or cloud credentials are required.
+CI runs lint and tests on Python 3.10–3.13, then builds the image and scans this repository through it. Pushing a `v*` tag publishes the multi-arch image to GHCR and the package to PyPI.
 
-## Observability
+## License
 
-The service logs all scan requests at INFO level including filename, requesting identity, and the full Trivy command. To go further:
-
-- **Prometheus metrics** — wrap `run_trivy_scan` to emit `scan_duration_seconds` (histogram) and `vulnerability_total` (counter labelled by severity).
-- **Structured logging** — swap `basicConfig` for `python-json-logger` and ship to Loki, CloudWatch Logs, or Datadog.
-- **Distributed tracing** — add `opentelemetry-instrumentation-fastapi` to correlate scanner spans with upstream pipeline traces.
-- **Alerting** — the webhook payload maps cleanly to PagerDuty events or Opsgenie alerts when `failed` is `true`.
+[MIT](LICENSE)
