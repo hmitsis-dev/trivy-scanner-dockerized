@@ -30,6 +30,19 @@ It ships as three things:
                      └──────────────────────────────────────┘
 ```
 
+## When to use this (and when not to)
+
+Trivy already has good options of its own. Pick the simplest one that covers your needs.
+
+| You want | Use |
+|----------|-----|
+| Scan in a single GitHub repo | [`aquasecurity/trivy-action`](https://github.com/aquasecurity/trivy-action) |
+| One shared vulnerability DB and Trivy version across runners | Trivy's built-in [client/server mode](https://trivy.dev/latest/docs/references/modes/client-server/) (`trivy server` + `trivy fs --server ...`) |
+| Dashboards, triage and finding history across many projects | [DefectDojo](https://github.com/DefectDojo/django-DefectDojo) or [Dependency-Track](https://dependencytrack.org/) |
+| One endpoint that applies the same fail-on rules everywhere, stores every report, sends a webhook, and accepts keyless GitHub OIDC, with no Trivy install in the pipeline | **This project** |
+
+The trade-off: the pipeline uploads its source tree to the scanner. Trivy's client/server mode sends only package metadata. If uploading source is unacceptable in your environment, use that instead. This project also doesn't provide a UI or history queries; reports are plain JSON files on disk or in S3, which you can feed into the tools above.
+
 ## Quick start
 
 ```bash
