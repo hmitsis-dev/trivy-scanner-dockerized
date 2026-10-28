@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -q
+
+  docker:
+    # Builds the image, starts it, and scans this repository with the client:
+    # an end-to-end check with the real Trivy binary.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t trivy-scanner:ci .
+      - name: Start scanner
+        run: |
+          docker run -d --name scanner -p 8000:8000 \
+            -e AUTH_MODE=api_key -e SCANNER_API_KEY=ci-secret \
+            trivy-scanner:ci
+          for i in $(seq 30); do curl -sf http://localhost:8000/healthz && exit 0; sleep 1; done
+          docker logs scanner; exit 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - name: Scan this repository
+        run: trivy-scan . --api-url http://localhost:8000 --api-key ci-secret --output scan-report.json
+      - if: failure()
+        run: docker logs scanner
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-report
+          path: scan-report.json
+          if-no-files-found: ignore

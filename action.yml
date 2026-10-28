@@ -1,0 +1,67 @@
+name: Trivy Scanner API scan
+description: Upload the repository to a self-hosted Trivy Scanner API and fail on blocking findings.
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  api-url:
+    description: Scanner base URL (or the full /scan-and-store endpoint).
+    required: true
+  api-key:
+    description: API key, when the server runs with AUTH_MODE=api_key.
+    required: false
+  oidc-audience:
+    description: Use a GitHub OIDC token for this audience instead of an API key (needs `id-token: write`).
+    required: false
+  path:
+    description: Directory to scan.
+    default: "."
+  severity:
+    description: Comma separated severities to report.
+    required: false
+  fail-on:
+    description: Comma separated severities that fail the step.
+    default: "CRITICAL,HIGH"
+  scan-mode:
+    description: fs, config or rootfs.
+    required: false
+  exclude:
+    description: Extra comma separated globs to leave out of the upload.
+    required: false
+  output:
+    description: Where to write the JSON response.
+    default: scan-report.json
+
+outputs:
+  report:
+    description: Path to the JSON response.
+    value: ${{ inputs.output }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - shell: bash
+      run: python -m pip install --quiet "$GITHUB_ACTION_PATH"
+    - shell: bash
+      env:
+        SCANNER_API_URL: ${{ inputs.api-url }}
+        SCANNER_API_KEY: ${{ inputs.api-key }}
+        INPUT_OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_SEVERITY: ${{ inputs.severity }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_SCAN_MODE: ${{ inputs.scan-mode }}
+        INPUT_EXCLUDE: ${{ inputs.exclude }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+      run: |
+        args=("$INPUT_PATH" --output "$INPUT_OUTPUT")
+        [ -n "$INPUT_OIDC_AUDIENCE" ] && args+=(--github-oidc "$INPUT_OIDC_AUDIENCE")
+        [ -n "$INPUT_SEVERITY" ] && args+=(--severity "$INPUT_SEVERITY")
+        [ -n "$INPUT_FAIL_ON" ] && args+=(--fail-on "$INPUT_FAIL_ON")
+        [ -n "$INPUT_SCAN_MODE" ] && args+=(--scan-mode "$INPUT_SCAN_MODE")
+        [ -n "$INPUT_EXCLUDE" ] && args+=(--exclude "$INPUT_EXCLUDE")
+        trivy-scan "${args[@]}"

@@ -1,0 +1,30 @@
+# Copy to .github/workflows/trivy-scan.yml in the repository you want to scan.
+name: Trivy Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  trivy-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # only needed for the OIDC variant
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hmitsis-dev/trivy-scanner-dockerized@v2
+        with:
+          api-url: ${{ vars.SCANNER_API_URL }}
+          api-key: ${{ secrets.SCANNER_API_KEY }}
+          # Or, keyless (server: AUTH_MODE=oidc, OIDC_AUDIENCE=trivy-scanner):
+          # oidc-audience: trivy-scanner
+          fail-on: CRITICAL,HIGH
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-scan-report
+          path: scan-report.json

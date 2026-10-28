@@ -1,0 +1,17 @@
+services:
+  scanner:
+    image: ghcr.io/hmitsis-dev/trivy-scanner-dockerized:latest
+    # build: ..   # or build from a checkout
+    ports: ["8000:8000"]
+    environment:
+      AUTH_MODE: api_key
+      SCANNER_API_KEY: ${SCANNER_API_KEY:?set SCANNER_API_KEY}
+      TRIVY_FAIL_ON_SEVERITY: CRITICAL,HIGH
+    volumes:
+      - reports:/data/reports
+      - trivy-cache:/var/cache/trivy
+    restart: unless-stopped
+
+volumes:
+  reports:
+  trivy-cache:
